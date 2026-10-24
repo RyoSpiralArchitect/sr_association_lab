@@ -1,0 +1,4 @@
+-r requirements.txt
+mlx>=0.31.2,<0.33; platform_system == "Darwin"
+mlx[cpu]>=0.31.2,<0.33; platform_system == "Linux"
+mlx-lm>=0.31.3,<0.33

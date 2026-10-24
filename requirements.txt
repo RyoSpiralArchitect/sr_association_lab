@@ -1,0 +1,7 @@
+# Shared analysis and tokenizer dependencies. Install PyTorch separately for
+# the torch backend, or use requirements-mlx.txt for native MLX inference.
+numpy>=1.26,<3
+matplotlib>=3.8,<4
+transformers>=4.57.6,<6
+safetensors>=0.4
+sentencepiece>=0.2

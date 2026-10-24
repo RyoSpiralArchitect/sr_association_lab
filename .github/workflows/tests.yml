@@ -1,0 +1,70 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  HF_HUB_OFFLINE: "1"
+  TRANSFORMERS_OFFLINE: "1"
+  HF_HUB_DISABLE_TELEMETRY: "1"
+  MPLBACKEND: Agg
+  OMP_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+
+jobs:
+  torch:
+    name: PyTorch / Python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Install CPU test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r requirements.txt pytest 'sentence-transformers>=5,<7'
+      - name: Check backend and run offline tests
+        run: |
+          python -c "import torch; print(torch.__version__)"
+          python -m pytest -q
+      - name: Exercise the public CLI and saved-trace reader
+        run: |
+          python sr_association_lab.py --help
+          python sr_association_lab.py demo --architecture gpt2 --steps 2 --max-new-tokens 4 --out runs/demo
+          python sr_association_lab.py inspect runs/demo --event 0 --token 0 --top 3
+
+  mlx:
+    name: Native MLX / Apple Silicon
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install native MLX test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-mlx.txt pytest
+      - name: Check backend and run native offline tests
+        run: |
+          python -c "import mlx.core as mx; import mlx_lm; assert mx.is_available(mx.cpu); print(mx.device_info())"
+          python -m pytest -q tests/test_mlx.py tests/test_compatibility.py
