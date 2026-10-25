@@ -56,6 +56,31 @@ establish scene quality, Japanese fluency, general capability, or performance
 comparability between backends. Private machine-local traces are not bundled
 with the source repository.
 
+## Saved-scene evaluation checks
+
+The extended suite passed **93 tests** locally on 2026-10-26 using the same
+Python/backend package versions as above. Evaluation tests include immutable
+source hashes, identity/gap rejection, lexical source spans, HTML escaping,
+reset-context separation, pair bounds, seed-level aggregation, interruption
+receipts and a real tiny random sequence classifier. The classifier test checks
+label order, logits/softmax, exact input IDs, length rejection and progress
+snapshots; it does not establish semantic accuracy. No trained weights are
+downloaded by the tests.
+
+A bounded local Llama 3.2 3B / MLX Metal experiment completed four seeds × eight
+steps × live/reset, using one frozen English night-station scene. All 64 responses
+passed the surface rule. Live recorded 1,472 generated tokens / 1,504 valid rows;
+reset recorded 1,175 / 1,207. All four matched first-turn pairs had identical
+prompt IDs, generated IDs and initial sampling RNG states. The saved ledgers,
+reset/live boundaries, N+1 rows and 448 arrays' valid regions passed structural
+checks. This audit did not rerun full-prefix numerical oracles.
+
+The two conditions were generated together; an older standalone live run was
+not reused as the baseline. In particular, a chat template may insert the current
+date. Results from this one origin and four seeds are descriptive, not a general
+capability comparison. Private trained-model traces and weights are excluded
+from the public repository.
+
 ## Continuous integration
 
 [GitHub Actions](https://github.com/RyoSpiralArchitect/sr_association_lab/actions/workflows/tests.yml)

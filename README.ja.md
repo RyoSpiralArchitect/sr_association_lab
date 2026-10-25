@@ -129,6 +129,29 @@ raw logitsとsampling処理後のscoreを区別し、同期したforward時間�
 `--similarity sentence-transformer --embedding-model PATH` と追加の依存ライブラリが必要です。
 `--similarity none` で無効にできます。
 
+### cosine以外から保存結果を読む
+
+```bash
+python sr_association_lab.py evaluate runs/night-station
+# 任意: ローカルNLIモデルで文のペアを判定（PyTorchが必要）
+python sr_association_lab.py evaluate runs/night-station \
+  --nli-model ./models/nli-deberta --nli-device cpu \
+  --out runs/night-station/evaluation-nli
+```
+
+`evaluation/report.html` でseedを切り替えながら本文を比較できます。生成はやり直しません。
+完全反復、連続する3単位の反復、共有する語と元の文中の位置、任意のNLIによる
+**含意・中立・矛盾候補**を分けて記録します。総合的な品質点は作らず、`eligible` も変更しません。
+
+`--condition both` の結果はseed・反復番号・段階を揃え、初回を除いて差を集計します。
+同じseedの反復を独立したseedとして数えません。resetの前の応答は文脈に使われていないことを明示します。
+NLIの値は校正済みの正答確率ではなく、確認する文を探す補助です。新しい出来事は中立になり得ますし、
+普通の状態変化が矛盾に見える場合もあります。
+
+モデルは既定ではローカルからのみ読み、取得には `--allow-download` の明示が必要です。
+Hubモデルは `--nli-revision` で固定できます。長すぎる文のペアは切り詰めず、判定不能として残します。
+[評価方法と制約](docs/EVALUATION.md)も参照してください。
+
 ## 制約と読み方
 
 - 記録するのはモデルの挙動とアクセスできる状態です。人間の連想や心理機構、意味的な品質を証明するものではありません。
