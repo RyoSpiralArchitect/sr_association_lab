@@ -2356,6 +2356,16 @@ NLI_CONTROLS = (
     ("contradiction", "The lamp is on.", "The lamp is not on."),
     ("neutral", "A woman carries a red suitcase.", "It is raining outside."),
 )
+NLI_NARRATIVE_PROBES = (
+    {"pair_id": "temporal_unmarked", "premise": "A woman was standing by the lamp.",
+     "hypothesis": "The woman sat down.", "expected_label": None},
+    {"pair_id": "temporal_explicit", "premise": "Earlier, a woman was standing by the lamp.",
+     "hypothesis": "Later, the woman sat down.", "expected_label": "neutral"},
+    {"pair_id": "different_referent", "premise": "One traveler carries a red suitcase.",
+     "hypothesis": "Another traveler carries a blue suitcase.", "expected_label": "neutral"},
+    {"pair_id": "new_event", "premise": "At first, a man was looking up at the light.",
+     "hypothesis": "Afterwards, the man turned his head and walked through the doorway.", "expected_label": "neutral"},
+)
 
 
 def scene_units(text):
@@ -2510,7 +2520,7 @@ def score_scene_nli(pairs, model_path, *, revision=None, device="cpu", batch_siz
     controls = [{"pair_id": f"control_{name}", "premise": left, "hypothesis": right,
                  "expected_label": name} for name, left, right in NLI_CONTROLS]
     results, encoded = [], []
-    for pair in [*pairs, *controls]:
+    for pair in [*pairs, *controls, *NLI_NARRATIVE_PROBES]:
         result = {**pair, "probabilities": None, "raw_logits": None, "token_count": None, "input_ids": None}
         if not pair["premise"].strip() or not pair["hypothesis"].strip():
             result["status"] = "empty_text"
@@ -2539,11 +2549,13 @@ def score_scene_nli(pairs, model_path, *, revision=None, device="cpu", batch_siz
             if progress_callback is not None:
                 progress_callback(results)
             print(f"NLI pairs: {min(offset + batch_size, len(encoded))}/{len(encoded)}", flush=True)
-    controls = results[len(pairs):]
-    for control in controls:
+    controls = results[len(pairs):len(pairs) + len(NLI_CONTROLS)]
+    probes = results[len(pairs) + len(NLI_CONTROLS):]
+    for control in [*controls, *probes]:
         distribution = control["probabilities"]
         control["observed_label"] = max(distribution, key=distribution.get) if distribution else None
-        control["passed"] = control["observed_label"] == control["expected_label"]
+        control["passed"] = (control["observed_label"] == control["expected_label"]
+                             if control["expected_label"] is not None else None)
     config_data = model.config.to_dict()
     local = Path(model_path)
     files = ([p for p in local.iterdir() if p.is_file() and p.suffix in {".safetensors", ".json", ".txt", ".model"}]
@@ -2561,6 +2573,9 @@ def score_scene_nli(pairs, model_path, *, revision=None, device="cpu", batch_siz
         "torch_version": torch.__version__, "transformers_version": importlib.metadata.version("transformers"),
         "control_pass_count": sum(c["passed"] for c in controls), "control_count": len(controls),
         "control_status": "passed" if all(c["passed"] for c in controls) else "failed",
+        "narrative_probes": probes,
+        "probe_interpretation": "Unmarked versus explicit chronology tests framing sensitivity; the unmarked case has no gold NLI label. "
+                                "The three explicit cases are expected neutral. These probes are not narrative validation.",
         "interpretation": "Uncalibrated NLI class scores. Controls are plumbing diagnostics, not narrative validation. "
                           "Neutral can mean legitimate new events; contradictions can be temporal changes or referent ambiguity."}
     return results[:len(pairs)], controls, metadata
@@ -2647,6 +2662,14 @@ def write_scene_evaluation_report(out, origin, rows, pairs, summary, nli_metadat
     if nli_metadata:
         parts.append(f"<p>NLI controls: {nli_metadata['control_pass_count']}/{nli_metadata['control_count']}. "
                      "These simple checks do not validate narrative judgments.</p>")
+        probes = nli_metadata.get("narrative_probes", [])
+        parts.append("<details><summary>Temporal framing and referent probes</summary><p>Compare unmarked and explicit "
+                     "chronology. The unmarked case has no gold NLI label. High contradiction is not a verdict on a sequence.</p>")
+        for probe in probes:
+            parts.append("<p><b>" + escape(probe["pair_id"]) + "</b>: " + escape(probe["premise"]) +
+                         " → " + escape(probe["hypothesis"]) + "</p><pre>" +
+                         escape(json.dumps(probe["probabilities"], indent=2)) + "</pre>")
+        parts.append("</details>")
     else:
         parts.append("<p>NLI was not run. Semantic judgments remain unavailable.</p>")
     parts.append("<details><summary>Matched comparison and denominators</summary><pre>" + escape(json.dumps(summary, indent=2)) + "</pre></details>")
@@ -2727,6 +2750,7 @@ def run_scene_evaluation(args):
         atomic_jsonl(out / "responses.jsonl", rows)
         atomic_jsonl(out / "pairs.jsonl", pairs)
         atomic_json(out / "controls.json", controls)
+        atomic_json(out / "probes.json", metadata["nli"]["narrative_probes"] if metadata["nli"] else [])
         atomic_json(out / "summary.json", summary)
         write_scene_evaluation_report(out, origin, rows, pairs, summary, metadata["nli"])
         metadata.update(status="complete", finished_at=now())

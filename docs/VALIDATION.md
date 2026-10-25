@@ -13,6 +13,7 @@ ability. No pretrained model download is required for the test suite.
 | `tests/test_imagination.py` | Frozen origins, origin-cache disposal, sentence stopping, scene identity and similarity |
 | `tests/test_mlx.py` | Native MLX caches, observer restoration, quantized loading, end-to-end trials and encoding |
 | `tests/test_compatibility.py` | Loader API compatibility, tokenizer overrides, finite sampling parameters, native GPT-2 oracles |
+| `tests/test_evaluation.py` | Saved-scene identity, evidence spans, matched aggregation, NLI bounds/provenance and interruption |
 
 Cached logits and selected hidden states are compared with independent
 full-prefix forwards. A final consume-only forward must provide the N+1th row.
@@ -80,6 +81,16 @@ not reused as the baseline. In particular, a chat template may insert the curren
 date. Results from this one origin and four seeds are descriptive, not a general
 capability comparison. Private trained-model traces and weights are excluded
 from the public repository.
+
+A pinned English DeBERTa NLI checkpoint also scored all 204 source sentence
+pairs, three smoke controls and four narrative probes on CPU. All three controls
+and three explicitly framed neutral probes matched their expected labels. The
+unmarked standing-to-sitting probe has no gold label: its contradiction score
+was 0.9995, while adding explicit earlier/later wording produced 0.9979 neutral.
+Several real story pairs also received high contradiction scores for plausible
+state changes. These results demonstrate framing sensitivity, not validated
+narrative consistency or calibrated error probabilities. Full source inputs,
+model/file hashes, logits and token IDs were retained locally.
 
 ## Continuous integration
 

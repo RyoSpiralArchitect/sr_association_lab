@@ -562,7 +562,8 @@ Derived cosine files are not required.
 | `pairs.jsonl` | Premise/hypothesis text, identity, predecessor/context flags, optional logits/scores/input IDs |
 | `summary.json` | Counts, initial text matches, per-seed differences, population/coverage definitions |
 | `controls.json` | NLI smoke controls, or empty when disabled |
-| `nli_progress.jsonl` | Latest atomic batch snapshot including controls; pending rows are not scores |
+| `probes.json` | Temporal-framing and referent probes, or empty when disabled; no gold label for the ambiguous unmarked transition |
+| `nli_progress.jsonl` | Latest atomic batch snapshot including controls and probes; pending rows are not scores |
 | `report.html` | Standalone escaped report with seed/repeat selection |
 
 Pair status is `not_scored`, `pending`, `scored`, `empty_text` or `input_too_long`.

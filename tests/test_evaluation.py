@@ -189,6 +189,9 @@ def test_nli_real_classifier_alignment_bounds_and_provenance(tmp_path):
     assert metadata["local_file_sha256"]["model.safetensors"]
     assert len(controls) == 3 and sum(c["passed"] for c in controls) == 1  # Constant classifier is not a validated judge.
     assert metadata["control_status"] == "failed"
+    probes = metadata["narrative_probes"]
+    assert len(probes) == 4 and probes[0]["passed"] is None  # No invented gold label for ambiguous time.
+    assert all(p["expected_label"] == "neutral" for p in probes[1:])
 
 
 def test_source_mutation_during_scoring_fails_without_complete_report(tmp_path, monkeypatch):

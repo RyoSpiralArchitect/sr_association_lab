@@ -57,6 +57,13 @@ not narrative calibration or validation. Softmax scores remain uncalibrated.
 Novel events may be neutral; temporal changes and uncertain referents may produce
 false contradiction candidates. No threshold automatically declares an error.
 
+Four additional narrative probes expose sensitivity to temporal framing and
+different referents. The unmarked standing → sitting pair has no gold NLI label;
+compare its scores with an explicit earlier → later version. Separate cases
+use another traveler and a subsequent new event. The three explicit cases are
+expected neutral, but passing them still does not validate judgments of real
+stories. Full probe inputs/scores appear in `probes.json` and the HTML report.
+
 ## Scope, bounds and aggregation
 
 Each response is paired with the frozen origin. Live adds up to the last
@@ -66,8 +73,8 @@ are explicit. Reset adds its adjacent output as a diagnostic with
 No other trial supplies history. Each full recorded response is one unit,
 including malformed/multi-sentence output; no hidden splitting or repair occurs.
 
-`--max-pairs` defaults to 4096 experiment pairs, plus three controls. Exceeding
-it fails before model loading. Each NLI batch commits a progress snapshot;
+`--max-pairs` defaults to 4096 experiment pairs, plus three controls and four
+probes. Exceeding it fails before model loading. Each NLI batch commits a progress snapshot;
 interrupted/error metadata never claims completion. Source hashes are checked
 again before writing a completed report to reject inputs changed during scoring.
 
