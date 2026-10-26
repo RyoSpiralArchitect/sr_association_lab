@@ -2,7 +2,7 @@
 """SR Association Lab: a one-file, local causal-LM observation harness.
 
 Run `python sr_association_lab.py --help`. Requires numpy/matplotlib for analysis,
-and PyTorch/Transformers OR MLX/mlx-lm for inference. No service or judge is used.
+and PyTorch/Transformers OR MLX/mlx-lm for inference. No remote judge is used.
 
 Alignment: row r contains the state of prefix prompt + generated[:r], and the
 raw logits predicting generated[r]. Row 0 is the last prompt position. A final
@@ -19,6 +19,7 @@ import dataclasses
 import datetime as dt
 import fnmatch
 import hashlib
+import html
 import importlib.metadata
 import inspect
 import json
@@ -2344,6 +2345,425 @@ def analyze_imagination(out, args, *, model=None, tokenizer=None):
     return destination
 
 
+EVALUATION_SCHEMA = "association-lab/scene-evaluation/1"
+LEXICAL_STOP_WORDS = frozenset("a an the and or but as at by for from in into of on onto to with without "
+    "is are was were be been being it its this that these those he she they his her their them "
+    "which who whose while had has have would could should will can did do does not no "
+    "i me my we us our you your s t m re ve ll d".split())
+NLI_LABELS = ("entailment", "neutral", "contradiction")
+NLI_CONTROLS = (
+    ("entailment", "A woman carries a red suitcase.", "A person carries a suitcase."),
+    ("contradiction", "The lamp is on.", "The lamp is not on."),
+    ("neutral", "A woman carries a red suitcase.", "It is raining outside."),
+)
+NLI_NARRATIVE_PROBES = (
+    {"pair_id": "temporal_unmarked", "premise": "A woman was standing by the lamp.",
+     "hypothesis": "The woman sat down.", "expected_label": None},
+    {"pair_id": "temporal_explicit", "premise": "Earlier, a woman was standing by the lamp.",
+     "hypothesis": "Later, the woman sat down.", "expected_label": "neutral"},
+    {"pair_id": "different_referent", "premise": "One traveler carries a red suitcase.",
+     "hypothesis": "Another traveler carries a blue suitcase.", "expected_label": "neutral"},
+    {"pair_id": "new_event", "premise": "At first, a man was looking up at the light.",
+     "hypothesis": "Afterwards, the man turned his head and walked through the doorway.", "expected_label": "neutral"},
+)
+
+
+def scene_units(text):
+    """Coarse lexical units with exact source offsets; not entities or coreference."""
+    pattern = r"[\u3400-\u9fff\u3040-\u30ff]|[^\W_]+"
+    return [{"unit": unicodedata.normalize("NFKC", m.group()).casefold(),
+             "text": m.group(), "start": m.start(), "end": m.end()}
+            for m in re.finditer(pattern, text)]
+
+
+def scene_lexical_pair(premise, hypothesis):
+    def content(text):
+        result = {}
+        for unit in scene_units(text):
+            if unit["unit"] not in LEXICAL_STOP_WORDS:
+                result.setdefault(unit["unit"], unit)
+        return result
+    left, right = content(premise), content(hypothesis)
+    shared, union = sorted(left.keys() & right.keys()), left.keys() | right.keys()
+    return {"jaccard": len(shared) / len(union) if left and right else None,
+            "shared_units": [{"unit": word, "premise_span": left[word], "hypothesis_span": right[word]}
+                             for word in shared]}
+
+
+def load_scene_evaluation_input(root):
+    root = Path(root)
+    paths = [root / name for name in ("manifest.json", "origin.json", "schedule.json", "responses.jsonl")]
+    if not all(path.is_file() for path in paths):
+        raise ValueError("Evaluation requires manifest, origin, schedule and responses files.")
+    hashes = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}
+    manifest = json.loads(paths[0].read_text(encoding="utf-8"))
+    origin = load_origin_scene(paths[1])
+    schedule = json.loads(paths[2].read_text(encoding="utf-8"))
+    rows = read_jsonl(paths[3])
+    if manifest.get("kind") != "imagination_experiment" or manifest.get("status") not in (
+            "complete", "generation_complete", "analysis_error"):
+        raise ValueError("Evaluate a finished imagination experiment; incomplete generation is not accepted.")
+    if not rows or manifest.get("origin_sha256") != origin["sha256"]:
+        raise ValueError("Missing responses or mismatched origin hash.")
+    if manifest.get("completed_responses") != len(rows) or manifest.get("completed_trials") != len(schedule):
+        raise ValueError("Completed counts disagree with the saved schedule/responses.")
+    trials = {t["trial_id"]: t for t in schedule}
+    if len(trials) != len(schedule):
+        raise ValueError("Duplicate trial identity in schedule.")
+    for trial in schedule:
+        if (not isinstance(trial["trial_id"], str) or not trial["trial_id"]
+                or any(type(trial.get(k)) is not int or trial[k] < 0 for k in ("sample_seed", "repeat_index"))
+                or type(trial.get("steps")) is not int or trial["steps"] < 1):
+            raise ValueError("Schedule requires a nonempty trial ID and nonnegative integer seed/repeat, positive steps.")
+    identities, paired = set(), set()
+    for row in rows:
+        step = row.get("step_index")
+        if isinstance(step, bool) or not isinstance(step, int) or step < 0:
+            raise ValueError("Each response needs a nonnegative integer step_index.")
+        identity = row.get("trial_id"), step
+        if identity in identities:
+            raise ValueError("Duplicate trial/step identity in responses.")
+        identities.add(identity)
+        trial = trials.get(row.get("trial_id"))
+        if (trial is None or any(row.get(k) != trial.get(k) for k in ("sample_seed", "repeat_index", "condition"))
+                or row.get("condition") not in ("live", "reset") or row.get("event_id") != step
+                or row.get("origin_sha256") != origin["sha256"]
+                or not isinstance(row.get("response"), str) or not isinstance(row.get("eligible"), bool)):
+            raise ValueError("Response identity, condition, origin or text disagrees with the schedule.")
+        pair_key = row["sample_seed"], row["repeat_index"], row["condition"], step
+        if pair_key in paired:
+            raise ValueError("Ambiguous seed/repeat/condition/step identity.")
+        paired.add(pair_key)
+    for trial in schedule:
+        steps = sorted(step for tid, step in identities if tid == trial["trial_id"])
+        if steps != list(range(trial["steps"])):
+            raise ValueError("Missing or unexpected response steps; no bridging missing predecessors.")
+    return origin, rows, hashes
+
+
+def build_scene_evaluation(origin, responses, history_window=8, max_pairs=4096):
+    """Separate observable repetition, lexical evidence, and optional directed NLI."""
+    if history_window < 1 or max_pairs < 1:
+        raise ValueError("history-window and max-pairs must be positive.")
+    lookup = {(r["trial_id"], r["step_index"]): r for r in responses}
+    if len(lookup) != len(responses):
+        raise ValueError("Duplicate trial/step identity.")
+    pairs, scored = [], []
+    for row in sorted(responses, key=lambda r: (r["trial_id"], r["step_index"])):
+        trial, step, text = row["trial_id"], row["step_index"], row["response"]
+        previous = lookup.get((trial, step - 1))
+        if step and previous is None:
+            raise ValueError("Missing immediate predecessor.")
+        prior = [lookup[(trial, i)] for i in range(step) if (trial, i) in lookup]
+        normalize = lambda value: " ".join(unicodedata.normalize("NFKC", value).casefold().split())
+        normalized = normalize(text)
+        units = [u["unit"] for u in scene_units(text)]
+        triples = [tuple(units[i:i + 3]) for i in range(max(0, len(units) - 2))]
+        duplicate = next((r["step_index"] for r in prior if normalized and normalize(r["response"]) == normalized), None)
+        prev_text = previous["response"] if previous is not None else origin["scene"]
+        lexical = scene_lexical_pair(prev_text, text)
+        item = {**row, "evaluation": {
+            "previous_kind": "response" if step else "origin",
+            "previous_used_as_context": row["condition"] == "live" or step == 0,
+            "exact_repeat_of_prior_output": bool(duplicate is not None) if normalized else None,
+            "exact_repeat_step": duplicate,
+            "repeated_trigram_fraction": 1 - len(set(triples)) / len(triples) if triples else None,
+            "previous_lexical_jaccard": lexical["jaccard"], "shared_lexical_units": lexical["shared_units"],
+            "previous_nli_entailment": None, "previous_nli_contradiction": None,
+            "max_context_contradiction": None, "max_context_contradiction_pair": None,
+            "history_window": history_window, "history_responses_omitted": max(0, step - history_window)
+                if row["condition"] == "live" else 0}}
+        references = [(-1, origin["scene"])]
+        if row["condition"] == "live":
+            references += [(r["step_index"], r["response"]) for r in prior[-history_window:]]
+        elif previous is not None:
+            references += [(step - 1, previous["response"])]
+        for index, premise in references:
+            if len(pairs) >= max_pairs:
+                raise ValueError("Evaluation pair budget exceeded; increase --max-pairs explicitly.")
+            is_previous = index == step - 1
+            pairs.append({"pair_id": f"p{len(pairs):06d}", "trial_id": trial,
+                "step_index": step, "condition": row["condition"], "sample_seed": row["sample_seed"],
+                "repeat_index": row["repeat_index"], "premise_step": index,
+                "premise_kind": "origin" if index == -1 else "response",
+                "is_previous": is_previous, "used_as_context": index == -1 or row["condition"] == "live",
+                "premise": premise, "hypothesis": text, "status": "not_scored", "probabilities": None})
+        scored.append(item)
+    return scored, pairs
+
+
+def nli_label_indices(config):
+    mapping = {str(value).strip().lower(): int(key) for key, value in config.id2label.items()}
+    if config.num_labels != 3 or set(mapping) != set(NLI_LABELS) or set(mapping.values()) != {0, 1, 2}:
+        raise ValueError("NLI model must declare entailment/neutral/contradiction in id2label; generic LABEL_0 mappings are not guessed.")
+    return mapping
+
+
+def score_scene_nli(pairs, model_path, *, revision=None, device="cpu", batch_size=4,
+                    max_length=512, local_files_only=True, progress_callback=None):
+    """Joint premise/hypothesis classifier; no generation, truncation or remote code."""
+    if batch_size < 1 or max_length < 1:
+        raise ValueError("NLI batch-size and max-length must be positive.")
+    import torch
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_path, revision=revision,
+        local_files_only=local_files_only, trust_remote_code=False)
+    model = AutoModelForSequenceClassification.from_pretrained(model_path, revision=revision,
+        local_files_only=local_files_only, trust_remote_code=False, use_safetensors=True)
+    labels = nli_label_indices(model.config)
+    model.to(device).eval()
+    limits = [max_length]
+    for candidate in (getattr(model.config, "max_position_embeddings", None), tokenizer.model_max_length):
+        if isinstance(candidate, int) and 0 < candidate < 10**9:
+            limits.append(candidate)
+    limit = min(limits)
+    controls = [{"pair_id": f"control_{name}", "premise": left, "hypothesis": right,
+                 "expected_label": name} for name, left, right in NLI_CONTROLS]
+    results, encoded = [], []
+    for pair in [*pairs, *controls, *NLI_NARRATIVE_PROBES]:
+        result = {**pair, "probabilities": None, "raw_logits": None, "token_count": None, "input_ids": None}
+        if not pair["premise"].strip() or not pair["hypothesis"].strip():
+            result["status"] = "empty_text"
+        else:
+            tokens = tokenizer(pair["premise"], pair["hypothesis"], truncation=False, add_special_tokens=True)
+            result["token_count"] = len(tokens["input_ids"])
+            result["input_ids"] = list(tokens["input_ids"])
+            result["status"] = "input_too_long" if result["token_count"] > limit else "pending"
+            if result["status"] == "pending":
+                encoded.append((len(results), tokens))
+        results.append(result)
+    if progress_callback is not None:
+        progress_callback(results)
+    with torch.inference_mode():
+        for offset in range(0, len(encoded), batch_size):
+            batch = encoded[offset:offset + batch_size]
+            inputs = tokenizer.pad([tokens for _, tokens in batch], padding=True, return_tensors="pt")
+            inputs = {key: value.to(device) for key, value in inputs.items()}
+            logits = model(**inputs).logits.detach().float().cpu().numpy().astype(np.float64)
+            if logits.shape != (len(batch), 3) or not np.isfinite(logits).all():
+                raise ValueError("NLI returned invalid logits.")
+            for (index, _), scores in zip(batch, logits):
+                prob, _ = probabilities(scores)
+                results[index].update(status="scored", raw_logits=scores.tolist(),
+                    probabilities={name: float(prob[labels[name]]) for name in NLI_LABELS})
+            if progress_callback is not None:
+                progress_callback(results)
+            print(f"NLI pairs: {min(offset + batch_size, len(encoded))}/{len(encoded)}", flush=True)
+    controls = results[len(pairs):len(pairs) + len(NLI_CONTROLS)]
+    probes = results[len(pairs) + len(NLI_CONTROLS):]
+    for control in [*controls, *probes]:
+        distribution = control["probabilities"]
+        control["observed_label"] = max(distribution, key=distribution.get) if distribution else None
+        control["passed"] = (control["observed_label"] == control["expected_label"]
+                             if control["expected_label"] is not None else None)
+    config_data = model.config.to_dict()
+    local = Path(model_path)
+    files = ([p for p in local.iterdir() if p.is_file() and p.suffix in {".safetensors", ".json", ".txt", ".model"}]
+             if local.is_dir() else [])
+    file_hashes = {}
+    for path in sorted(files):
+        with path.open("rb") as stream:
+            file_hashes[path.name] = hashlib.file_digest(stream, "sha256").hexdigest()
+    metadata = {"model": str(model_path), "requested_revision": revision,
+        "resolved_commit": getattr(model.config, "_commit_hash", None), "local_file_sha256": file_hashes,
+        "config_sha256": hashlib.sha256(json.dumps(config_data, sort_keys=True).encode()).hexdigest(),
+        "id2label": model.config.id2label, "device": str(device), "batch_size": batch_size,
+        "parameter_dtypes": sorted({str(p.dtype) for p in model.parameters()}), "torch_threads": torch.get_num_threads(),
+        "effective_max_length": limit, "truncation": False, "local_files_only": local_files_only,
+        "torch_version": torch.__version__, "transformers_version": importlib.metadata.version("transformers"),
+        "control_pass_count": sum(c["passed"] for c in controls), "control_count": len(controls),
+        "control_status": "passed" if all(c["passed"] for c in controls) else "failed",
+        "narrative_probes": probes,
+        "probe_interpretation": "Unmarked versus explicit chronology tests framing sensitivity; the unmarked case has no gold NLI label. "
+                                "The three explicit cases are expected neutral. These probes are not narrative validation.",
+        "interpretation": "Uncalibrated NLI class scores. Controls are plumbing diagnostics, not narrative validation. "
+                          "Neutral can mean legitimate new events; contradictions can be temporal changes or referent ambiguity."}
+    return results[:len(pairs)], controls, metadata
+
+
+def attach_scene_nli(rows, pairs):
+    by_key = {(row["trial_id"], row["step_index"]): row["evaluation"] for row in rows}
+    for pair in pairs:
+        if pair.get("status") != "scored":
+            continue
+        score = by_key[pair["trial_id"], pair["step_index"]]
+        probs = pair["probabilities"]
+        if pair["is_previous"]:
+            score["previous_nli_entailment"] = probs["entailment"]
+            score["previous_nli_contradiction"] = probs["contradiction"]
+        if pair["used_as_context"] and (score["max_context_contradiction"] is None or
+                                      probs["contradiction"] > score["max_context_contradiction"]):
+            score["max_context_contradiction"] = probs["contradiction"]
+            score["max_context_contradiction_pair"] = pair["pair_id"]
+
+
+def summarize_scene_evaluation(rows):
+    metrics = ("exact_repeat_of_prior_output", "repeated_trigram_fraction", "previous_lexical_jaccard",
+               "previous_nli_entailment", "previous_nli_contradiction")
+    lookup = {(r["sample_seed"], r["repeat_index"], r["step_index"], r["condition"]): r for r in rows}
+    if len(lookup) != len(rows):
+        raise ValueError("Ambiguous seed/repeat/condition/step pairing.")
+    keys = sorted({key[:3] for key in lookup})
+    matched = [(lookup.get((*k, "live")), lookup.get((*k, "reset"))) for k in keys if k[2] > 0]
+    initial = [{"sample_seed": seed, "repeat_index": repeat,
+                "text_matches": lookup[(seed, repeat, 0, "live")]["response"] == lookup[(seed, repeat, 0, "reset")]["response"]}
+               for seed, repeat, step in keys if step == 0 and (seed, repeat, 0, "live") in lookup
+               and (seed, repeat, 0, "reset") in lookup]
+    comparisons = {}
+    for population in ("all_responses", "both_surface_eligible"):
+        scores = {}
+        for metric in metrics:
+            per_repeat, count = {}, 0
+            for live, reset in matched:
+                if live is None or reset is None or (population == "both_surface_eligible" and not (live["eligible"] and reset["eligible"])):
+                    continue
+                a, b = live["evaluation"][metric], reset["evaluation"][metric]
+                if a is None or b is None:
+                    continue
+                per_repeat.setdefault((live["sample_seed"], live["repeat_index"]), []).append(float(a) - float(b))
+                count += 1
+            per_seed = {}
+            for (seed, _), values in per_repeat.items():
+                per_seed.setdefault(seed, []).append(float(np.mean(values)))
+            differences = [{"sample_seed": seed, "live_minus_reset": float(np.mean(values)), "repeat_count": len(values)}
+                           for seed, values in sorted(per_seed.items())]
+            values = [r["live_minus_reset"] for r in differences]
+            scores[metric] = {"matched_response_pairs": count, "distinct_seed_count": len(values),
+                "by_seed": differences, "mean_seed_difference": float(np.mean(values)) if values else None,
+                "min_seed_difference": min(values) if values else None, "max_seed_difference": max(values) if values else None}
+        comparisons[population] = scores
+    conditions = {}
+    for condition in sorted({r["condition"] for r in rows}):
+        group = [r for r in rows if r["condition"] == condition]
+        conditions[condition] = {"responses": len(group), "eligible": sum(r["eligible"] for r in group),
+            "distinct_seed_count": len({r["sample_seed"] for r in group})}
+    return {"conditions": conditions, "initial_pairs": initial,
+        "unmatched_post_initial_keys": sum(a is None or b is None for a, b in matched),
+        "paired": comparisons, "aggregation": "Exclude step 0; matched seed/repeat/step, average steps within repeat, "
+        "then repeats within seed, then seeds equally. Descriptive differences only; no p-values, quality score or independent-response claim.",
+        "reset_semantics": "Adjacent reset outputs were never context. Shared sampling seeds do not align later RNG draws.",
+        "history_maximum": "Review aid only, excluded from paired metrics: more prior sentences give more chances for a high score."}
+
+
+def write_scene_evaluation_report(out, origin, rows, pairs, summary, nli_metadata):
+    """Self-contained, escaped HTML; text and evidence remain inspectable offline."""
+    escape = lambda text: html.escape(str(text), quote=True)
+    css = "body{font:16px/1.55 system-ui;max-width:1250px;margin:35px auto;padding:0 20px;color:#17232c} " \
+          "table{border-collapse:collapse;width:100%;table-layout:fixed}td,th{padding:12px;border:1px solid #dce3e7;vertical-align:top} " \
+          "th{background:#edf4f5}td:first-child{width:6%}small{color:#52646c}blockquote{border-left:3px solid #559594;padding-left:14px} " \
+          "select,button{font:inherit;padding:6px}details{margin:14px 0}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px} " \
+          ".seed{margin-top:25px} .text{white-space:pre-wrap} .badge{color:#8e3d20}"
+    parts = ["<!doctype html><html lang='en'><meta charset='utf-8'><meta name='viewport' content='width=device-width'>",
+        "<title>Scene evaluation</title><style>" + css + "</style><body><h1>Scene evaluation</h1>",
+        "<p>Read text, repetition and directed NLI separately. There is no combined quality score.</p>",
+        "<blockquote>" + escape(origin["scene"]) + "</blockquote>",
+        "<p>Live keeps history. Reset starts at the same origin each time; its adjacent outputs did not condition each other. "
+        "NLI scores are uncalibrated and can mistake temporal changes for contradictions. Shared words are lexical evidence, not resolved entities.</p>"]
+    if nli_metadata:
+        parts.append(f"<p>NLI controls: {nli_metadata['control_pass_count']}/{nli_metadata['control_count']}. "
+                     "These simple checks do not validate narrative judgments.</p>")
+        probes = nli_metadata.get("narrative_probes", [])
+        parts.append("<details><summary>Temporal framing and referent probes</summary><p>Compare unmarked and explicit "
+                     "chronology. The unmarked case has no gold NLI label. High contradiction is not a verdict on a sequence.</p>")
+        for probe in probes:
+            parts.append("<p><b>" + escape(probe["pair_id"]) + "</b>: " + escape(probe["premise"]) +
+                         " → " + escape(probe["hypothesis"]) + "</p><pre>" +
+                         escape(json.dumps(probe["probabilities"], indent=2)) + "</pre>")
+        parts.append("</details>")
+    else:
+        parts.append("<p>NLI was not run. Semantic judgments remain unavailable.</p>")
+    parts.append("<details><summary>Matched comparison and denominators</summary><pre>" + escape(json.dumps(summary, indent=2)) + "</pre></details>")
+    groups = sorted({(r["sample_seed"], r["repeat_index"]) for r in rows})
+    parts.append("<label>Seed / repeat <select id='selection'><option value='all'>All</option>" +
+                 "".join(f"<option value='{seed}-{repeat}'>{seed} / {repeat}</option>" for seed, repeat in groups) + "</select></label>")
+    for seed, repeat in groups:
+        group = [r for r in rows if (r["sample_seed"], r["repeat_index"]) == (seed, repeat)]
+        by_step = {(r["step_index"], r["condition"]): r for r in group}
+        parts.append(f"<section class='seed' data-key='{seed}-{repeat}'><h2>Seed {seed} / repeat {repeat}</h2><table>"
+                     "<thead><tr><th style='width:6%'>Step</th><th>Live</th><th>Reset</th></tr></thead><tbody>")
+        for step in sorted({r["step_index"] for r in group}):
+            parts.append(f"<tr><td>{step}</td>")
+            for condition in ("live", "reset"):
+                row = by_step.get((step, condition))
+                if row is None:
+                    parts.append("<td>Not recorded</td>")
+                    continue
+                value = row["evaluation"]
+                info = {k: v for k, v in value.items() if k != "shared_lexical_units"}
+                shared = ", ".join(u["unit"] for u in value["shared_lexical_units"])
+                parts.append("<td><div class='text'>" + escape(row["response"]) + "</div><small>Surface eligible: " +
+                    escape(row["eligible"]) + "; shared lexical units: " + escape(shared or "none") +
+                    "</small><details><summary>Measurements and exact spans</summary><pre>" +
+                    escape(json.dumps({**info, "shared_lexical_units": value["shared_lexical_units"]}, ensure_ascii=False, indent=2)) + "</pre></details></td>")
+            parts.append("</tr>")
+        parts.append("</tbody></table></section>")
+    candidates = sorted((p for p in pairs if p.get("status") == "scored" and p["used_as_context"]),
+                        key=lambda p: (-p["probabilities"]["contradiction"], p["pair_id"]))
+    parts.append("<h2>Context pairs for review</h2><p>Up to 20 highest contradiction scores; ranking does not establish errors.</p>")
+    for pair in candidates[:20]:
+        parts.append("<details><summary>" + escape(f"{pair['pair_id']} · {pair['condition']} seed {pair['sample_seed']} · "
+            f"step {pair['premise_step']} → {pair['step_index']} · contradiction {pair['probabilities']['contradiction']:.3f}") +
+            "</summary><p><b>Premise:</b> " + escape(pair["premise"]) + "</p><p><b>Hypothesis:</b> " +
+            escape(pair["hypothesis"]) + "</p><pre>" + escape(json.dumps(pair["probabilities"], indent=2)) + "</pre></details>")
+    parts.append("<script>document.getElementById('selection').addEventListener('change',function(){document.querySelectorAll('.seed').forEach(s=>{s.hidden=this.value!=='all'&&s.dataset.key!==this.value;});});</script></body></html>")
+    (Path(out) / "report.html").write_text("\n".join(parts), encoding="utf-8")
+
+
+def run_scene_evaluation(args):
+    root = Path(args.run_dir)
+    out = Path(args.out) if args.out else root / "evaluation"
+    if out.exists():
+        raise ValueError(f"Evaluation output already exists: {out}. Choose a new directory.")
+    origin, responses, hashes = load_scene_evaluation_input(root)
+    rows, pairs = build_scene_evaluation(origin, responses, args.history_window, args.max_pairs)
+    metadata = {"schema_version": EVALUATION_SCHEMA, "created_at": now(), "status": "running",
+        "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(), "source_run": str(root.resolve()),
+        "source_sha256": hashes, "origin_sha256": origin["sha256"], "language": origin.get("language"),
+        "row_count": len(rows), "pair_count": len(pairs),
+        "config": vars(args), "nli": None,
+        "lexical_policy": "NFKC/casefold units with original character offsets; CJK characters and Unicode alphanumeric spans; "
+                          "fixed English stop words for overlap; no stemming or entity/coreference claims",
+        "stop_words": sorted(LEXICAL_STOP_WORDS), "repetition_policy": "Exact prior-output match collapses whitespace and case/NFKC; "
+            "within-response repeated trigram fraction = 1 - unique/all trigrams, null if fewer than 3 units",
+        "pair_scope": "Origin plus last history-window prior responses for live; origin plus immediate unused predecessor for reset; no cross-trial history",
+        "quality_score": None, "semantic_validation": "Not established; NLI is an optional evidence-linked review aid."}
+    out.mkdir(parents=True)
+    atomic_json(out / "metadata.json", metadata)
+    controls = []
+    try:
+        if args.nli_model:
+            def save_progress(items):
+                atomic_jsonl(out / "nli_progress.jsonl", items)
+                metadata["nli_scored_items"] = sum(item.get("status") == "scored" for item in items)
+                atomic_json(out / "metadata.json", metadata)
+            pairs, controls, metadata["nli"] = score_scene_nli(pairs, args.nli_model,
+                revision=args.nli_revision, device=args.nli_device, batch_size=args.nli_batch_size,
+                max_length=args.nli_max_length, local_files_only=not args.allow_download, progress_callback=save_progress)
+            attach_scene_nli(rows, pairs)
+            if metadata["nli"].get("control_status") == "failed":
+                print("Warning: NLI smoke controls failed; inspect controls.json before interpreting model scores.", file=sys.stderr)
+        # Detect source replacement during a longer model-based evaluation.
+        for name, checksum in hashes.items():
+            if hashlib.sha256((root / name).read_bytes()).hexdigest() != checksum:
+                raise ValueError("Source run changed during evaluation; refusing a mixed report.")
+        summary = summarize_scene_evaluation(rows)
+        atomic_jsonl(out / "responses.jsonl", rows)
+        atomic_jsonl(out / "pairs.jsonl", pairs)
+        atomic_json(out / "controls.json", controls)
+        atomic_json(out / "probes.json", metadata["nli"]["narrative_probes"] if metadata["nli"] else [])
+        atomic_json(out / "summary.json", summary)
+        write_scene_evaluation_report(out, origin, rows, pairs, summary, metadata["nli"])
+        metadata.update(status="complete", finished_at=now())
+    except BaseException as exc:
+        metadata.update(status="interrupted" if isinstance(exc, KeyboardInterrupt) else "error",
+                        error_type=type(exc).__name__, error=str(exc), finished_at=now())
+        raise
+    finally:
+        atomic_json(out / "metadata.json", metadata)
+    print(f"Evaluation: {out / 'report.html'}", flush=True)
+    return out
+
+
 def write_experiment_transcript(out):
     out = Path(out)
     rows = read_jsonl(out / "responses.jsonl")
@@ -3654,6 +4074,17 @@ def make_parser():
     plot = commands.add_parser("plot", help="Replot saved traces without torch/model weights")
     plot.add_argument("run_dir")
     plot.add_argument("--event", type=int)
+    evaluate = commands.add_parser("evaluate", help="Evaluate saved scenes: repetition, evidence, paired conditions and optional local NLI")
+    evaluate.add_argument("run_dir")
+    evaluate.add_argument("--out", help="New report directory; default RUN/evaluation. Saved generation is never changed.")
+    evaluate.add_argument("--history-window", type=int, default=8, help="Maximum prior live responses per NLI hypothesis (origin always included)")
+    evaluate.add_argument("--max-pairs", type=int, default=4096, help="Fail before model loading if the pair budget is exceeded")
+    evaluate.add_argument("--nli-model", help="Optional local three-label sequence classifier with semantic id2label")
+    evaluate.add_argument("--nli-revision")
+    evaluate.add_argument("--nli-device", default="cpu")
+    evaluate.add_argument("--nli-batch-size", type=int, default=4)
+    evaluate.add_argument("--nli-max-length", type=int, default=512, help="Overlong pairs are marked unavailable; never truncated")
+    evaluate.add_argument("--allow-download", action="store_true", help="Allow explicit NLI model downloads; default is local files only")
     summary = commands.add_parser("inspect", help="Inspect full raw logits for one generation position")
     summary.add_argument("run_dir")
     summary.add_argument("--event", type=int, default=0)
@@ -3679,6 +4110,8 @@ def main(argv=None):
             run_experiment(args)
         elif args.command == "imagine":
             run_imagination(args)
+        elif args.command == "evaluate":
+            run_scene_evaluation(args)
         elif args.command == "plot":
             manifest = json.loads((Path(args.run_dir) / "manifest.json").read_text(encoding="utf-8"))
             if manifest.get("kind") in ("bank_experiment", "imagination_experiment") and args.event is not None:

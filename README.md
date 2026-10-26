@@ -158,6 +158,30 @@ It is a descriptive proxy, not a dedicated semantic-similarity score. Use
 `--similarity sentence-transformer --embedding-model PATH` for an external saved
 encoder, or `--similarity none` to disable it.
 
+### Evaluate saved scenes beyond cosine
+
+```bash
+python sr_association_lab.py evaluate runs/night-station
+# Optional joint sentence-pair NLI classifier; requires PyTorch.
+python sr_association_lab.py evaluate runs/night-station \
+  --nli-model ./models/nli-deberta --nli-device cpu \
+  --out runs/night-station/evaluation-nli
+```
+
+Open `evaluation/report.html` for an offline comparison by seed. Generation is
+not repeated. Exact repetition, repeated trigrams, lexical overlap with source
+spans, and optional **entailment / neutral / contradiction** scores remain
+separate; there is no combined quality score or change to `eligible`.
+
+For `--condition both` experiments, differences match seed/repeat/step, exclude
+initial responses and average repeats within seed. Reset predecessors are
+explicitly marked as **not used as context**. NLI scores are uncalibrated review
+aids: new events can be neutral, and state changes can look contradictory.
+
+Models are local-only by default. Downloads require `--allow-download`; use
+`--nli-revision` to pin a Hub model. Overlong pairs become unavailable without
+truncation. See [evaluation methods and limits](docs/EVALUATION.md).
+
 ## Scope and limits
 
 - These traces describe model behavior and accessible states. They do not

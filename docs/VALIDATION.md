@@ -13,6 +13,7 @@ ability. No pretrained model download is required for the test suite.
 | `tests/test_imagination.py` | Frozen origins, origin-cache disposal, sentence stopping, scene identity and similarity |
 | `tests/test_mlx.py` | Native MLX caches, observer restoration, quantized loading, end-to-end trials and encoding |
 | `tests/test_compatibility.py` | Loader API compatibility, tokenizer overrides, finite sampling parameters, native GPT-2 oracles |
+| `tests/test_evaluation.py` | Saved-scene identity, evidence spans, matched aggregation, NLI bounds/provenance and interruption |
 
 Cached logits and selected hidden states are compared with independent
 full-prefix forwards. A final consume-only forward must provide the N+1th row.
@@ -55,6 +56,41 @@ These trained-model runs establish a bounded execution check. They do not
 establish scene quality, Japanese fluency, general capability, or performance
 comparability between backends. Private machine-local traces are not bundled
 with the source repository.
+
+## Saved-scene evaluation checks
+
+The extended suite passed **93 tests** locally on 2026-10-26 using the same
+Python/backend package versions as above. Evaluation tests include immutable
+source hashes, identity/gap rejection, lexical source spans, HTML escaping,
+reset-context separation, pair bounds, seed-level aggregation, interruption
+receipts and a real tiny random sequence classifier. The classifier test checks
+label order, logits/softmax, exact input IDs, length rejection and progress
+snapshots; it does not establish semantic accuracy. No trained weights are
+downloaded by the tests.
+
+A bounded local Llama 3.2 3B / MLX Metal experiment completed four seeds × eight
+steps × live/reset, using one frozen English night-station scene. All 64 responses
+passed the surface rule. Live recorded 1,472 generated tokens / 1,504 valid rows;
+reset recorded 1,175 / 1,207. All four matched first-turn pairs had identical
+prompt IDs, generated IDs and initial sampling RNG states. The saved ledgers,
+reset/live boundaries, N+1 rows and 448 arrays' valid regions passed structural
+checks. This audit did not rerun full-prefix numerical oracles.
+
+The two conditions were generated together; an older standalone live run was
+not reused as the baseline. In particular, a chat template may insert the current
+date. Results from this one origin and four seeds are descriptive, not a general
+capability comparison. Private trained-model traces and weights are excluded
+from the public repository.
+
+A pinned English DeBERTa NLI checkpoint also scored all 204 source sentence
+pairs, three smoke controls and four narrative probes on CPU. All three controls
+and three explicitly framed neutral probes matched their expected labels. The
+unmarked standing-to-sitting probe has no gold label: its contradiction score
+was 0.9995, while adding explicit earlier/later wording produced 0.9979 neutral.
+Several real story pairs also received high contradiction scores for plausible
+state changes. These results demonstrate framing sensitivity, not validated
+narrative consistency or calibrated error probabilities. Full source inputs,
+model/file hashes, logits and token IDs were retained locally.
 
 ## Continuous integration
 

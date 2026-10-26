@@ -547,6 +547,32 @@ heatmaps include every ID and explicitly bin when needed. Finite values and
 -inf masks are displayed separately. Source arrays retain all original values
 at the stored dtype.
 
+## Independent scene evaluation
+
+`evaluate RUN [--out NEW_DIRECTORY]` writes additive format
+`association-lab/scene-evaluation/1`; the generation format is unchanged.
+Input is the finished experiment's manifest, origin, schedule and authoritative
+root responses. Hashes, counts and complete, unambiguous identities are checked.
+Derived cosine files are not required.
+
+| File | Contents |
+| --- | --- |
+| `metadata.json` | Input/source hashes, status, configuration, lexical policy, optional NLI identity |
+| `responses.jsonl` | Original fields plus `evaluation`; unchanged text and eligibility |
+| `pairs.jsonl` | Premise/hypothesis text, identity, predecessor/context flags, optional logits/scores/input IDs |
+| `summary.json` | Counts, initial text matches, per-seed differences, population/coverage definitions |
+| `controls.json` | NLI smoke controls, or empty when disabled |
+| `probes.json` | Temporal-framing and referent probes, or empty when disabled; no gold label for the ambiguous unmarked transition |
+| `nli_progress.jsonl` | Latest atomic batch snapshot including controls and probes; pending rows are not scores |
+| `report.html` | Standalone escaped report with seed/repeat selection |
+
+Pair status is `not_scored`, `pending`, `scored`, `empty_text` or `input_too_long`.
+Unavailable scores are null. Premise step `-1` is the origin; other indices refer
+only to the same trial. Reset adjacency has `used_as_context=false`. Full NLI
+input IDs include pair special tokens; no truncation is applied. Named softmax
+scores are uncalibrated. See [evaluation methods](EVALUATION.md) for definitions,
+budgets, aggregation, provenance and interpretation limits.
+
 ## Primary implementation references
 
 - [Transformers: cache explanation](https://huggingface.co/docs/transformers/main/en/cache_explanation)

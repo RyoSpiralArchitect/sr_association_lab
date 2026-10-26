@@ -67,4 +67,4 @@ jobs:
       - name: Check backend and run native offline tests
         run: |
           python -c "import mlx.core as mx; import mlx_lm; assert mx.is_available(mx.cpu); print(mx.device_info())"
-          python -m pytest -q tests/test_mlx.py tests/test_compatibility.py
+          python -m pytest -q tests/test_mlx.py tests/test_compatibility.py tests/test_evaluation.py
